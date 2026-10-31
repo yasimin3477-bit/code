@@ -1,0 +1,485 @@
+#include <WiFi.h>                  // ไลบรารีสำหรับเชื่อมต่อเครือข่าย WiFi ของ ESP32
+#include <WiFiClientSecure.h>      // ไลบรารีสำหรับการเชื่อมต่อ WiFi แบบปลอดภัย (HTTPS/SSL) สำหรับ Telegram
+#include <UniversalTelegramBot.h>  // ไลบรารีสำหรับสร้างบอท Telegram
+#include <PubSubClient.h>          // ไลบรารีสำหรับการเชื่อมต่อและสื่อสารผ่านโปรโตคอล MQTT
+#include <ArduinoJson.h>           // ไลบรารีสำหรับจัดการข้อมูลรูปแบบ JSON
+#include <SPI.h>                   // ไลบรารีสำหรับการสื่อสารผ่านบัส SPI (ใช้กับโมดูล RFID)
+#include <MFRC522.h>               // ไลบรารีสำหรับใช้งานโมดูลอ่านบัตร RFID MFRC522
+#include <ESP32Servo.h>            // ไลบรารีสำหรับควบคุมเซอร์โวมอเตอร์บน ESP32
+#include <WebServer.h>             // ไลบรารีสำหรับสร้าง Web Server ภายในตัว ESP32
+#include "time.h"                  // ไลบรารีสำหรับจัดการเวลา (ดึงเวลาจาก NTP)
+
+// ================= Pin Configuration (กำหนดขาสัญญาณ) =================
+#define SS_PIN       5             // กำหนดขา SDA (SS) ของ RFID ต่อเข้ากับขา 5
+#define RST_PIN      17            // กำหนดขา RST ของ RFID ต่อเข้ากับขา 17
+#define TRIG_PIN     33            // กำหนดขา Trig ของเซ็นเซอร์อัลตราโซนิก ต่อเข้ากับขา 33
+#define ECHO_PIN     32            // กำหนดขา Echo ของเซ็นเซอร์อัลตราโซนิก ต่อเข้ากับขา 32
+#define SERVO_PIN    13            // กำหนดขาควบคุมเซอร์โวมอเตอร์ ต่อเข้ากับขา 13
+#define BUZZER_PIN   14            // กำหนดขาควบคุมบัซเซอร์ (ลำโพง) ต่อเข้ากับขา 14
+
+// ================= Network & Telegram Config (ตั้งค่าเครือข่าย) =================
+const char* ssid         = "M";             // ชื่อ WiFi ที่ต้องการเชื่อมต่อ
+const char* password     = "123456789";     // รหัสผ่าน WiFi
+const char* mqtt_server  = "mqtt.thaiappify.com"; // ที่อยู่ของเซิร์ฟเวอร์ MQTT
+const int   mqtt_port    = 1883;            // พอร์ตของการเชื่อมต่อ MQTT
+
+const char* mqtt_user    = "mon";           // ชื่อผู้ใช้งานสำหรับเชื่อมต่อ MQTT
+const char* mqtt_pass    = "mon";           // รหัสผ่านสำหรับเชื่อมต่อ MQTT
+
+#define BOTtoken "8877641238:AAGuA2hqfvDNo5YwTwrLz76-SNP11cM9TMY" // Token ของ Telegram Bot
+#define CHAT_ID  "8702051201"               // Chat ID สำหรับส่งข้อความใน Telegram
+
+// ================= MQTT Topics (หัวข้อสำหรับสื่อสาร MQTT) =================
+const char* topic_status  = "pillbox/status";  // หัวข้อสำหรับอัปเดตสถานะของเครื่อง
+const char* topic_log     = "pills/new";       // หัวข้อสำหรับบันทึกประวัติการทานยา
+const char* topic_request = "pills/request";   // หัวข้อสำหรับรับคำสั่งร้องขอ
+
+// NTP Time Server (ตั้งค่าเซิร์ฟเวอร์เวลา)
+const char* ntpServer1   = "th.pool.ntp.org";  // เซิร์ฟเวอร์เวลาเทียบมาตรฐานที่ 1
+const char* ntpServer2   = "time.navy.mi.th";  // เซิร์ฟเวอร์เวลาเทียบมาตรฐานที่ 2
+const long  gmtOffset_sec = 7 * 3600;          // ปรับชดเชยเวลาเป็น GMT+7 (เวลาประเทศไทย)
+const int   daylightOffset_sec = 0;            // ไม่มีการปรับเวลาช่วงฤดูร้อน (Daylight Saving Time)
+
+// ================= Object Declarations (สร้างออบเจ็กต์) =================
+MFRC522 mfrc522(SS_PIN, RST_PIN);              // สร้างออบเจ็กต์สำหรับ RFID
+Servo myServo;                                 // สร้างออบเจ็กต์สำหรับควบคุมเซอร์โวมอเตอร์
+WiFiClient espClient;                          // สร้างออบเจ็กต์ WiFi Client พื้นฐาน
+PubSubClient client(espClient);                // สร้างออบเจ็กต์ MQTT โดยใช้ WiFi Client
+WiFiClientSecure botClient;                    // สร้างออบเจ็กต์ WiFi Client แบบปลอดภัยสำหรับ Telegram
+UniversalTelegramBot bot(BOTtoken, botCli ent); // สร้างออบเจ็กต์ Telegram Bot
+WebServer server(80);                          // สร้างออบเจ็กต์ Web Server ทำงานที่พอร์ต 80
+
+// ================= Global Variables (ตัวแปรส่วนกลาง) =================
+String morningTime = "08:00"; // ตั้งเวลาทานยามื้อเช้าเริ่มต้น
+String noonTime    = "12:00"; // ตั้งเวลาทานยามื้อเที่ยงเริ่มต้น
+String eveningTime = "18:00"; // ตั้งเวลาทานยามื้อเย็นเริ่มต้น
+
+bool morningTaken = false;    // สถานะการทานยามื้อเช้า (false = ยังไม่ทาน, true = ทานแล้ว)
+bool noonTaken    = false;    // สถานะการทานยามื้อเที่ยง
+bool eveningTaken = false;    // สถานะการทานยามื้อเย็น
+
+bool morningDueNotified = false; // สถานะการแจ้งเตือนเมื่อถึงเวลาทานยามื้อเช้า
+bool noonDueNotified    = false; // สถานะการแจ้งเตือนเมื่อถึงเวลาทานยามื้อเที่ยง
+bool eveningDueNotified = false; // สถานะการแจ้งเตือนเมื่อถึงเวลาทานยามื้อเย็น
+
+bool morningOverdueNotified = false; // สถานะการแจ้งเตือนเมื่อเลยเวลาทานยามื้อเช้า
+bool noonOverdueNotified    = false; // สถานะการแจ้งเตือนเมื่อเลยเวลาทานยามื้อเที่ยง
+bool eveningOverdueNotified = false; // สถานะการแจ้งเตือนเมื่อเลยเวลาทานยามื้อเย็น
+
+unsigned long lastBuzzerAlertTime = 0; // ตัวแปรเก็บเวลาล่าสุดที่บัซเซอร์ดัง (ใช้นับเวลาเตือน)
+bool isAlarmActive = false;            // สถานะการทำงานของเสียงเตือน
+
+int currentDay = -1;                   // เก็บวันที่ปัจจุบันเพื่อเช็กการขึ้นวันใหม่
+String AUTHORIZED_UID = "A9 22 28 07"; // UID ของบัตร RFID ที่ได้รับอนุญาต
+
+// ================= Functions เสียง =================
+void soundSuccess() {
+  digitalWrite(BUZZER_PIN, HIGH); delay(100); // เปิดเสียง 100 มิลลิวินาที
+  digitalWrite(BUZZER_PIN, LOW);  delay(100); // ปิดเสียง 100 มิลลิวินาที
+  digitalWrite(BUZZER_PIN, HIGH); delay(100); // เปิดเสียง 100 มิลลิวินาที
+  digitalWrite(BUZZER_PIN, LOW);              // ปิดเสียง (เสียงสั้น 2 ครั้ง = สำเร็จ)
+}
+
+void soundError() {
+  digitalWrite(BUZZER_PIN, HIGH); delay(600); // เปิดเสียงยาว 600 มิลลิวินาที
+  digitalWrite(BUZZER_PIN, LOW);              // ปิดเสียง (เสียงยาว 1 ครั้ง = ผิดพลาด)
+}
+
+void soundWarning() {
+  digitalWrite(BUZZER_PIN, HIGH); delay(80);  // เปิดเสียง 80 มิลลิวินาที
+  digitalWrite(BUZZER_PIN, LOW);  delay(80);  // ปิดเสียง 80 มิลลิวินาที
+  digitalWrite(BUZZER_PIN, HIGH); delay(80);  // เปิดเสียง 80 มิลลิวินาที
+  digitalWrite(BUZZER_PIN, LOW);              // ปิดเสียง (เสียงรัวสั้น = เตือน)
+}
+
+void stopAlarm() {
+  isAlarmActive = false;                      // ปิดสถานะการแจ้งเตือน
+  digitalWrite(BUZZER_PIN, LOW);              // ปิดบัซเซอร์
+}
+
+// ================= Functions เวลา =================
+String getCurrentTime() {
+  struct tm timeinfo;                                      // โครงสร้างสำหรับเก็บข้อมูลเวลา
+  if (!getLocalTime(&timeinfo)) return "0000-00-00 00:00:00"; // ถ้าดึงเวลาไม่ได้ให้คืนค่า 0 กลับไป
+  char timeStringBuff[30];                                 // สร้างตัวแปรเก็บข้อความเวลา
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo); // จัดรูปแบบเวลา ปี-เดือน-วัน ชั่วโมง:นาที:วินาที
+  return String(timeStringBuff);                           // ส่งคืนค่าเวลาเป็น String
+}
+
+int getCurrentMinutesOfDay() {
+  struct tm timeinfo;                                      // โครงสร้างสำหรับเก็บข้อมูลเวลา
+  if (!getLocalTime(&timeinfo)) return -1;                 // ถ้าดึงเวลาไม่ได้ คืนค่า -1
+  return (timeinfo.tm_hour * 60) + timeinfo.tm_min;        // แปลงเวลาชั่วโมงและนาทีปัจจุบันให้อยู่ในหน่วยนาทีทั้งหมด
+}
+
+int timeToMinutes(String timeStr) {
+  int hour = timeStr.substring(0, 2).toInt();              // ตัดเอา 2 ตัวแรกมาแปลงเป็นตัวเลขชั่วโมง
+  int min  = timeStr.substring(3, 5).toInt();              // ตัดเอา 2 ตัวหลังมาแปลงเป็นตัวเลขนาที
+  return (hour * 60) + min;                                // แปลงทั้งหมดเป็นนาที
+}
+
+// ฟังก์ชันอัปเดตเวลาและรีเซ็ตสถานะการทานยา/เตือนอย่างสมบูรณ์แบบ
+void updateMealTime(String meal, String newTime) {
+  newTime.trim();                                          // ลบช่องว่างหน้า-หลังของเวลาใหม่
+  if (meal == "morning") {                                 // ถ้าเป็นมื้อเช้า
+    morningTime = newTime;                                 // อัปเดตเวลามื้อเช้า
+    morningTaken = false;                                  // รีเซ็ตสถานะการทานยา
+    morningDueNotified = false;                            // รีเซ็ตการแจ้งเตือน
+    morningOverdueNotified = false;                        // รีเซ็ตการแจ้งเตือนเลยเวลา
+  } 
+  else if (meal == "noon") {                               // ถ้าเป็นมื้อเที่ยง
+    noonTime = newTime;                                    // อัปเดตเวลามื้อเที่ยง
+    noonTaken = false;                                     // รีเซ็ตสถานะต่างๆ
+    noonDueNotified = false;
+    noonOverdueNotified = false;
+  } 
+  else if (meal == "evening") {                            // ถ้าเป็นมื้อเย็น
+    eveningTime = newTime;                                 // อัปเดตเวลามื้อเย็น
+    eveningTaken = false;                                  // รีเซ็ตสถานะต่างๆ
+    eveningDueNotified = false;
+    eveningOverdueNotified = false;
+  }
+  stopAlarm();                                             // ปิดเสียงเตือน (ถ้าดังอยู่)
+  Serial.println("-> อัปเดตเวลาทานยา " + meal + " เป็น " + newTime + " พร้อมรีเซ็ตสถานะเรียบร้อย"); // แจ้ง Log บน Serial Monitor
+}
+
+void sendRFIDLog(String statusText, String uidStr, String nextMeal = "", String nextTime = "") {
+  DynamicJsonDocument doc(256);                            // สร้างเอกสาร JSON ขนาด 256 ไบต์
+  statusText.trim();                                       // ลบช่องว่าง
+  doc["status"] = statusText;                              // กำหนดค่าคีย์ "status"
+  doc["uid"]    = uidStr;                                  // กำหนดค่าคีย์ "uid"
+  if (nextMeal != "") doc["next_meal"] = nextMeal;         // ถ้ามีมื้อถัดไป ให้ใส่ใน JSON
+  if (nextTime != "") doc["next_time"] = nextTime;         // ถ้ามีเวลาถัดไป ให้ใส่ใน JSON
+
+  char buffer[256];                                        // สร้างบัฟเฟอร์ข้อความ
+  serializeJson(doc, buffer);                              // แปลง JSON ลงในบัฟเฟอร์
+  client.publish(topic_log, buffer);                       // ส่งข้อมูล (Publish) ไปที่ MQTT Topic 
+}
+
+void checkDayReset() {
+  struct tm timeinfo;                                      // โครงสร้างตัวแปรเวลา
+  if (getLocalTime(&timeinfo)) {                           // ดึงเวลามาเช็ก
+    if (timeinfo.tm_mday != currentDay) {                  // ถ้าวันที่ปัจจุบันไม่ตรงกับที่บันทึกไว้ (แสดงว่าขึ้นวันใหม่)
+      currentDay = timeinfo.tm_mday;                       // อัปเดตวันที่เป็นวันใหม่
+      morningTaken = false;   noonTaken = false;   eveningTaken = false; // รีเซ็ตการทานยาทุกมื้อเป็น 'ยังไม่ทาน'
+      morningDueNotified = false;     noonDueNotified = false;     eveningDueNotified = false; // รีเซ็ตการแจ้งเตือน
+      morningOverdueNotified = false; noonOverdueNotified = false; eveningOverdueNotified = false; // รีเซ็ตการแจ้งเตือนเกินเวลา
+      stopAlarm();                                         // ปิดเสียง
+      Serial.println("-> วันใหม่: รีเซ็ตสถานะการทานยาทั้งหมด"); // พิมพ์แจ้งใน Serial Monitor
+    }
+  }
+}
+
+String getValidMealNow() {
+  int nowMins = getCurrentMinutesOfDay();                  // ดูว่าตอนนี้กี่นาทีของวันแล้ว
+  if (nowMins == -1) return "none";                        // ถ้าดึงเวลาไม่ได้ให้ออกไป
+
+  int mTime = timeToMinutes(morningTime);                  // แปลงเวลามื้อเช้าเป็นนาที
+  int nTime = timeToMinutes(noonTime);                     // แปลงเวลามื้อเที่ยงเป็นนาที
+  int eTime = timeToMinutes(eveningTime);                  // แปลงเวลามื้อเย็นเป็นนาที
+
+  if (nowMins >= mTime && !morningTaken) return "morning"; // ถ้าเลยเวลาเช้าและยังไม่ทาน -> คืนค่ามื้อเช้า
+  if (nowMins >= nTime && !noonTaken) return "noon";       // ถ้าเลยเวลาเที่ยงและยังไม่ทาน -> คืนค่ามื้อเที่ยง
+  if (nowMins >= eTime && !eveningTaken) return "evening"; // ถ้าเลยเวลาเย็นและยังไม่ทาน -> คืนค่ามื้อเย็น
+
+  return "none";                                           // ถ้าทานหมดแล้ว หรือยังไม่ถึงเวลา คืนค่า none
+}
+
+void getNextMealInfo(String &nextMealName, String &nextMealTime) {
+  int nowMins = getCurrentMinutesOfDay();                  // เวลาปัจจุบันเป็นนาที
+  int mTime = timeToMinutes(morningTime);                  // เวลามื้อเช้า
+  int nTime = timeToMinutes(noonTime);                     // เวลามื้อเที่ยง
+  int eTime = timeToMinutes(eveningTime);                  // เวลามื้อเย็น
+
+  if (nowMins < mTime) {                                   // ถ้ายังไม่ถึงมื้อเช้า
+    nextMealName = "มื้อเช้า"; nextMealTime = morningTime; // บอกว่ามื้อต่อไปคือเช้า
+  } else if (nowMins < nTime) {                            // ถ้าผ่านเช้าไปแล้ว แต่ยังไม่ถึงเที่ยง
+    nextMealName = "มื้อเที่ยง"; nextMealTime = noonTime; // บอกว่ามื้อต่อไปคือเที่ยง
+  } else if (nowMins < eTime) {                            // ถ้าผ่านเที่ยงไปแล้ว แต่ยังไม่ถึงเย็น
+    nextMealName = "มื้อเย็น"; nextMealTime = eveningTime; // บอกว่ามื้อต่อไปคือเย็น
+  } else {                                                 // ถ้าเลยมื้อเย็นไปแล้ว
+    nextMealName = "มื้อเช้า (วันถัดไป)"; nextMealTime = morningTime; // บอกว่ามื้อต่อไปคือเช้าพรุ่งนี้
+  }
+}
+
+// ระบบตรวจสอบการเตือนทานยาแบบประเมินเงื่อนไขยืดหยุ่น
+void checkPillTimeAlerts() {
+  int nowMins = getCurrentMinutesOfDay();                  // เวลาปัจจุบัน
+  if (nowMins == -1) return;                               // ถ้าดึงเวลาล้มเหลว ออกจากฟังก์ชัน
+
+  int mTime = timeToMinutes(morningTime);                  // เวลามื้อเช้าเป็นนาที
+  int nTime = timeToMinutes(noonTime);                     // เวลามื้อเที่ยงเป็นนาที
+  int eTime = timeToMinutes(eveningTime);                  // เวลามื้อเย็นเป็นนาที
+
+  // --- เช็กมื้อเช้า ---
+  if (!morningTaken) {                                     // ถ้ายังไม่ทานมื้อเช้า
+    if (nowMins >= mTime && nowMins < (mTime + 15)) {      // ถ้าอยู่ในช่วง 15 นาทีหลังจากถึงเวลา
+      if (!morningDueNotified) {                           // ถ้ายังไม่ได้เตือน
+        morningDueNotified = true; isAlarmActive = true;   // ตั้งสถานะว่าเตือนแล้ว และเปิดระบบแจ้งเตือน
+        bot.sendMessage(CHAT_ID, "⏰ [ถึงเวลาทานยา!] กรุณาแตะบัตรเพื่อรับยามื้อเช้า", ""); // แจ้งผ่าน Telegram
+      }
+    } else if (nowMins >= (mTime + 15)) {                  // ถ้าเกิน 15 นาทีไปแล้ว
+      if (!morningOverdueNotified) {                       // ถ้ายังไม่แจ้งเตือนเกินเวลา
+        morningDueNotified = true; morningOverdueNotified = true; isAlarmActive = true; // อัปเดตว่าเตือนทั้ง 2 แบบแล้ว
+        bot.sendMessage(CHAT_ID, "⚠️ [เลยเวลาทานยา 15 นาที!] กรุณามาแตะบัตรเพื่อรับยามื้อเช้าด่วน!", ""); // แจ้งใน Telegram ว่าเลยเวลา
+      }
+    }
+  }
+
+  // --- เช็กมื้อเที่ยง ---
+  if (!noonTaken) {                                        // ถ้ายังไม่ทานมื้อเที่ยง (กระบวนการเหมือนมื้อเช้า)
+    if (nowMins >= nTime && nowMins < (nTime + 15)) {
+      if (!noonDueNotified) {
+        noonDueNotified = true; isAlarmActive = true;
+        bot.sendMessage(CHAT_ID, "⏰ [ถึงเวลาทานยา!] กรุณาแตะบัตรเพื่อรับยามื้อเที่ยง", "");
+      }
+    } else if (nowMins >= (nTime + 15)) {
+      if (!noonOverdueNotified) {
+        noonDueNotified = true; noonOverdueNotified = true; isAlarmActive = true;
+        bot.sendMessage(CHAT_ID, "⚠️ [เลยเวลาทานยา 15 นาที!] กรุณามาแตะบัตรเพื่อรับยามื้อเที่ยงด่วน!", "");
+      }
+    }
+  }
+
+  // --- เช็กมื้อเย็น ---
+  if (!eveningTaken) {                                     // ถ้ายังไม่ทานมื้อเย็น (กระบวนการเหมือนมื้อเช้า)
+    if (nowMins >= eTime && nowMins < (eTime + 15)) {
+      if (!eveningDueNotified) {
+        eveningDueNotified = true; isAlarmActive = true;
+        bot.sendMessage(CHAT_ID, "⏰ [ถึงเวลาทานยา!] กรุณาแตะบัตรเพื่อรับยามื้อเย็น", "");
+      }
+    } else if (nowMins >= (eTime + 15)) {
+      if (!eveningOverdueNotified) {
+        eveningDueNotified = true; eveningOverdueNotified = true; isAlarmActive = true;
+        bot.sendMessage(CHAT_ID, "⚠️ [เลยเวลาทานยา 15 นาที!] กรุณามาแตะบัตรเพื่อรับยามื้อเย็นด่วน!", "");
+      }
+    }
+  }
+
+  // --- ระบบส่งเสียง Buzzer เตือน ---
+  if (isAlarmActive) {                                     // ถ้าอยู่ในสถานะต้องส่งเสียงเตือน
+    bool isOverdue = (morningOverdueNotified || noonOverdueNotified || eveningOverdueNotified); // เช็กว่ามีการเลยเวลาทานยาหรือไม่
+    if (isOverdue) {                                       // กรณีเลยเวลา
+      if (millis() - lastBuzzerAlertTime >= 1500 || lastBuzzerAlertTime == 0) { // ทุก 1.5 วินาที
+        digitalWrite(BUZZER_PIN, HIGH); delay(400);        // เสียงยาว 400ms
+        digitalWrite(BUZZER_PIN, LOW);  delay(100);        // เว้น 100ms
+        digitalWrite(BUZZER_PIN, HIGH); delay(400);        // เสียงยาว 400ms
+        digitalWrite(BUZZER_PIN, LOW);                     // ปิดเสียง
+        lastBuzzerAlertTime = millis();                    // อัปเดตเวลาล่าสุดที่เสียงดัง
+      }
+    } else {                                               // กรณีพึ่งถึงเวลาเตือนปกติ (ยังไม่เกิน)
+      if (millis() - lastBuzzerAlertTime >= 60000 || lastBuzzerAlertTime == 0) { // เตือนทุกๆ 60 วินาที
+        digitalWrite(BUZZER_PIN, HIGH); delay(150);        // เสียงสั้น 150ms
+        digitalWrite(BUZZER_PIN, LOW);  delay(100);        // เว้น 100ms
+        digitalWrite(BUZZER_PIN, HIGH); delay(150);        // เสียงสั้น 150ms
+        digitalWrite(BUZZER_PIN, LOW);                     // ปิดเสียง
+        lastBuzzerAlertTime = millis();                    // อัปเดตเวลาล่าสุดที่เสียงดัง
+      }
+    }
+  } else {                                                 // ถ้าไม่มีอะไรต้องเตือน
+    digitalWrite(BUZZER_PIN, LOW);                         // ปิดบัซเซอร์ให้สนิท
+  }
+}
+
+float checkPillDistance() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);       // รีเซ็ตขาส่งคลื่นอัลตราโซนิก
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);     // ปล่อยคลื่น 10 ไมโครวินาที
+  digitalWrite(TRIG_PIN, LOW);                             // หยุดปล่อย
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);          // จับเวลาคลื่นสะท้อนกลับ
+  return duration * 0.034 / 2;                             // คำนวณความเร็วเสียงเป็นระยะทาง (เซนติเมตร)
+}
+
+// ================= ฟังก์ชันจ่ายยาตามองศาที่ระบุ =================
+void dispensePill(String mealName) {
+  int targetAngle = 0;                                     // องศาเริ่มต้น
+
+  if (mealName == "morning")      targetAngle = 35;        // มื้อเช้า หมุนไป 35 องศา
+  else if (mealName == "noon")    targetAngle = 105;       // มื้อเที่ยง หมุนไป 105 องศา
+  else if (mealName == "evening") targetAngle = 170;       // มื้อเย็น หมุนไป 170 องศา
+  else targetAngle = 35;                                   // ค่าเริ่มต้น
+
+  myServo.write(targetAngle);                              // สั่งเซอร์โวให้หมุนไปตามองศาที่ตั้งไว้
+  delay(2000);                                             // ค้างไว้ 2 วินาทีให้ยาหล่นลงมา
+  myServo.write(0);                                        // หมุนกลับมาตำแหน่ง 0 องศาเตรียมพร้อมใหม่
+}
+
+// ================= WEB SERVER HANDLERS =================
+void handleRoot() {
+  // รับค่าจากการ Submit หน้าเว็บมาตั้งเวลาใหม่ (ถ้ามีการส่งมา)
+  if (server.hasArg("morning")) updateMealTime("morning", server.arg("morning"));
+  if (server.hasArg("noon"))    updateMealTime("noon", server.arg("noon"));
+  if (server.hasArg("evening")) updateMealTime("evening", server.arg("evening"));
+
+  // สร้างหน้าเว็บ HTML เริ่มต้นด้วย Tag โครงสร้างหลัก
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>ESP32 Smart Pillbox</title>";            // ชื่อหน้าเว็บ
+  // กำหนดรูปแบบ CSS พื้นฐาน
+  html += "<style>body{font-family:Arial,sans-serif;background:#f4f7f6;margin:0;padding:20px;text-align:center;}";
+  html += ".card{background:white;padding:20px;max-width:400px;margin:0 auto;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,0.1);}";
+  html += "h2{color:#333;} label{display:block;margin:10px 0 5px;font-weight:bold;text-align:left;}";
+  html += "input[type='time']{width:90%;padding:10px;font-size:16px;border:1px solid #ccc;border-radius:6px;}";
+  html += "input[type='submit']{background:#28a745;color:white;border:none;padding:12px 20px;margin-top:15px;font-size:16px;border-radius:6px;cursor:pointer;width:100%;}";
+  html += ".status{margin-top:20px;padding:10px;background:#e9ecef;border-radius:6px;text-align:left;}";
+  html += "</style></head><body>";
+  
+  // เนื้อหาในกล่องการ์ดหลักของหน้าเว็บ
+  html += "<div class='card'><h2>💊 เครื่องจ่ายยาอัจฉริยะ</h2>";
+  html += "<p><b>เวลาเครื่อง:</b> " + getCurrentTime() + "</p>"; // แสดงเวลาของ ESP32
+  
+  // ฟอร์มสำหรับตั้งเวลาใหม่แต่ละมื้อ
+  html += "<form action='/' method='POST'>";
+  html += "<label>🌅 มื้อเช้า:</label><input type='time' name='morning' value='" + morningTime + "'>";
+  html += "<label>☀️ มื้อเที่ยง:</label><input type='time' name='noon' value='" + noonTime + "'>";
+  html += "<label>🌙 มื้อเย็น:</label><input type='time' name='evening' value='" + eveningTime + "'>";
+  html += "<input type='submit' value='💾 บันทึกเวลาใหม่'>";
+  html += "</form>";
+
+  // ส่วนแสดงสถานะว่าวันนี้ทานยามื้อไหนไปแล้วบ้าง
+  html += "<div class='status'><h4>📊 สถานะการทานยาวันนี้:</h4>";
+  html += "เช้า: " + String(morningTaken ? "✅ ทานแล้ว" : "❌ ยังไม่ได้ทาน") + "<br>"; // ถ้าเช้า ทานแล้ว ให้ติ๊กถูก ไม่งั้นกากบาท
+  html += "เที่ยง: " + String(noonTaken ? "✅ ทานแล้ว" : "❌ ยังไม่ได้ทาน") + "<br>";  // เที่ยง
+  html += "เย็น: " + String(eveningTaken ? "✅ ทานแล้ว" : "❌ ยังไม่ได้ทาน");         // เย็น
+  html += "</div></div></body></html>";                    // ปิด Tag HTML
+
+  server.send(200, "text/html", html);                     // ส่งหน้า HTML ออกไปยังบราวเซอร์
+}
+
+void callback(char* topic, byte* payload, unsigned int length) { // เมื่อได้รับข้อความจาก MQTT
+  String message = "";                                     // ตัวแปรเก็บข้อความที่ได้
+  for (int i = 0; i < length; i++) message += (char)payload[i]; // แปลง byte มาต่อเป็นข้อความ String
+
+  DynamicJsonDocument doc(512);                            // สร้างตัวรับ JSON ขนาด 512 ไบต์
+  DeserializationError error = deserializeJson(doc, message); // แปลง String คืนกลับเป็น JSON โครงสร้าง
+
+  if (!error) {                                            // ถ้าแปลงสำเร็จไม่มีข้อผิดพลาด
+    if (doc.containsKey("meal") && doc.containsKey("time")) { // และมีข้อมูล meal กับ time ส่งมา
+      String meal = doc["meal"].as<String>();              // อ่านมื้อยา
+      String time = doc["time"].as<String>();              // อ่านเวลาที่ต้องอัปเดต
+      updateMealTime(meal, time);                          // อัปเดตเวลาทานยาผ่าน MQTT
+    }
+  }
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {                            // ทำวนไปเรื่อยๆ จนกว่า MQTT จะต่อติด
+    String clientId = "ESP32_PillDispenser_" + String(random(0xffff), HEX); // สุ่มชื่อ Client
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) { // ถ้าต่อติด
+      client.subscribe(topic_status);                      // ให้เริ่มรอรับฟังข้อมูลหัวข้อ topic_status
+    } else {
+      delay(3000);                                         // ถ้าต่อไม่ติดให้รอ 3 วินาทีแล้วลองใหม่
+    }
+  }
+}
+
+// ================= SETUP (ตั้งค่าเริ่มต้นตอนเปิดเครื่อง) =================
+void setup() {
+  Serial.begin(115200);                                    // เปิดพอร์ต Serial ความเร็ว 115200
+
+  pinMode(TRIG_PIN, OUTPUT);                               // เซ็นเซอร์อัลตราโซนิก ขาซ้ายสั่งปล่อยคลื่น (Output)
+  pinMode(ECHO_PIN, INPUT);                                // เซ็นเซอร์อัลตราโซนิก ขาขวารับคลื่นสะท้อน (Input)
+  pinMode(BUZZER_PIN, OUTPUT);                             // บัซเซอร์ (เสียง) ให้เป็นขาออก
+  digitalWrite(BUZZER_PIN, LOW);                           // เริ่มต้นปิดเสียง
+  
+  // เซ็ตตำแหน่ง Servo ไปที่ 0 องศาตอนเริ่มต้น
+  myServo.attach(SERVO_PIN);                               // ผูกขา Servo
+  myServo.write(0);                                        // หมุนไปที่ศูนย์องศา
+  delay(500);                                              // รอเซ็ตอัพครึ่งวินาที
+
+  SPI.begin();                                             // เริ่มต้นการสื่อสาร SPI
+  mfrc522.PCD_Init();                                      // เริ่มต้นโมดูล RFID
+
+  WiFi.begin(ssid, password);                              // สั่งเชื่อมต่อ WiFi ด้วยข้อมูลที่ตั้งไว้
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {                  // รอจนกว่าจะต่อ WiFi เสร็จ
+    delay(500);                                            // รอทีละ 0.5 วิ
+    Serial.print(".");                                     // พิมพ์จุดเพื่อบอกว่ากำลังทำงาน
+  }
+  
+  Serial.println("\nWiFi Connected!");                     // พิมพ์บอกว่าต่อ WiFi สำเร็จ
+  Serial.print("🌐 เข้าหน้าเว็บได้ที่ IP: http://");           
+  Serial.println(WiFi.localIP());                          // แสดง IP ของ ESP32 เพื่อเข้าหน้าเว็บ
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2); // สั่งซิงค์เวลาจากอินเทอร์เน็ต
+
+  client.setServer(mqtt_server, mqtt_port);                // กำหนดที่อยู่และพอร์ต MQTT
+  client.setCallback(callback);                            // ตั้งฟังก์ชันที่จะถูกเรียกเมื่อมีข้อมูลใหม่เข้ามาใน MQTT
+  botClient.setInsecure();                                 // ปิดการตรวจสอบใบรับรอง SSL ชั่วคราวเพื่อให้ Telegram ต่อติดง่ายๆ
+
+  server.on("/", handleRoot);                              // หากเข้าผ่านหน้าเว็บ / จะให้เรียกฟังก์ชัน handleRoot
+  server.begin();                                          // เริ่มเปิดเซิร์ฟเวอร์เว็บ
+  Serial.println("HTTP Server Started");                   // แจ้งใน Serial
+
+  soundSuccess();                                          // เปิดเสียงตื๊ดๆ ยืนยันเครื่องเปิดสมบูรณ์
+  
+  String startMsg = "🚀 [System Ready] ระบบจ่ายยาออนไลน์แล้ว!\n"; // สร้างข้อความต้อนรับ
+  startMsg += "🌐 IP หน้าเว็บ: http://" + WiFi.localIP().toString(); // แนบ IP ในข้อความ
+  bot.sendMessage(CHAT_ID, startMsg, "");                  // ส่งข้อความไปที่ Telegram
+}
+
+// ================= LOOP (ลูปทำงานวนซ้ำหลัก) =================
+void loop() {
+  server.handleClient();                                   // จัดการคำขอ (Request) จาก Web Server อย่างต่อเนื่อง
+
+  if (!client.connected()) {                               // ถ้าหลุดจากเซิร์ฟเวอร์ MQTT
+    reconnectMQTT();                                       // พยายามเชื่อมต่อใหม่
+  }
+  client.loop();                                           // รักษาและอัปเดตการเชื่อมต่อ MQTT (ห้ามเอาออก)
+
+  checkDayReset();                                         // ตรวจสอบว่าขึ้นวันใหม่หรือยัง ถ้าขึ้นแล้วจะรีเซ็ตสถานะ
+  checkPillTimeAlerts();                                   // ตรวจสอบเวลาปัจจุบันว่าถึงเวลาต้องเตือนกินยาหรือไม่
+
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { // ตรวจสอบว่ามีบัตรมาแตะหรือไม่
+    return;                                                // ถ้าไม่มีให้ออกจากลูปวนไปเริ่มใหม่ด้านบน
+  }
+
+  String scannedUID = "";                                  // สร้างตัวแปรเก็บรหัสบัตรที่อ่านได้
+  for (byte i = 0; i < mfrc522.uid.size; i++) {            // วนลูปอ่านข้อมูลทีละไบต์จากบัตร
+    scannedUID += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : ""); // ถ้าไบต์น้อยกว่า 0x10 (16 ฐานสิบ) ให้เติม 0 ข้างหน้า
+    scannedUID += String(mfrc522.uid.uidByte[i], HEX);     // นำรหัสมาแปลงเป็นรหัสฐานสิบหก 
+    if (i < mfrc522.uid.size - 1) scannedUID += " ";       // เติมเว้นวรรคระหว่างไบต์ (แก้บรรทัดผิดใน prompt ให้เป็นตัวลบ)
+  }
+  scannedUID.toUpperCase();                                // แปลงรหัสบัตรเป็นตัวพิมพ์ใหญ่ทั้งหมด
+  scannedUID.trim();                                       // ลบช่องว่างหัวท้าย
+
+  String activeMeal = getValidMealNow();                   // เช็กว่าตอนที่บัตรแตะ เป็นเวลาของยา "มื้อไหน" ที่ต้องทาน
+
+  if (scannedUID != AUTHORIZED_UID) {                      // ถ้าบัตรที่แตะ ไม่ตรงกับบัตรผู้ป่วยที่บันทึกไว้
+    soundError();                                          // เสียงเตือนผิดพลาด
+    sendRFIDLog("บัตรไม่ถูกต้อง", scannedUID);                // บันทึก Log เข้า MQTT ว่าแตะบัตรผิด
+  } 
+  else if (activeMeal == "none") {                         // ถ้าบัตรถูก แต่ไม่ใช่เวลากินยา 
+    soundWarning();                                        // เสียงเตือนระวัง
+    String nextMealName = "", nextMealTime = "";           // เตรียมตัวแปรบอกมื้อถัดไป
+    getNextMealInfo(nextMealName, nextMealTime);           // ดึงข้อมูลว่ายาที่ต้องกินครั้งถัดไปคือตอนไหน
+    sendRFIDLog("แตะก่อนเวลา", scannedUID, nextMealName, nextMealTime); // บันทึก Log ว่ามากินก่อนเวลา
+  }
+  else {                                                   // ถ้าบัตรถูก และถึงเวลากินยาแล้ว
+    float distance = checkPillDistance();                  // วัดระยะทางในกล่องยาด้วยเซนเซอร์อัลตราโซนิก
+    if (distance > 15.0) {                                 // ถ้าระยะเกิน 15cm หมายความว่ากล่องยาไม่อยู่
+      soundWarning();                                      // เสียงเตือนระวัง
+      sendRFIDLog("ไม่พบกล่องยา", scannedUID);                // บันทึก Log ว่าไม่เจอกล่องยา
+    } 
+    else {                                                 // กรณีกล่องยาอยู่พร้อมทำงานครบทุกอย่าง
+      stopAlarm();                                         // หยุดการแจ้งเตือนเสียง
+      String mealTH = "";                                  // ตัวแปรชื่อมื้อภาษาไทย
+      if (activeMeal == "morning") {                       // กรณีเป็นมื้อเช้า
+        morningTaken = true; morningDueNotified = true; morningOverdueNotified = true; mealTH = "มื้อเช้า"; // อัปเดตสถานะและหยุดการเตือนสำหรับมื้อนี้
+      } else if (activeMeal == "noon") {                   // กรณีเป็นมื้อเที่ยง
+        noonTaken = true; noonDueNotified = true; noonOverdueNotified = true; mealTH = "มื้อเที่ยง"; // อัปเดตสถานะมื้อเที่ยง
+      } else if (activeMeal == "evening") {                // กรณีเป็นมื้อเย็น
+        eveningTaken = true; eveningDueNotified = true; eveningOverdueNotified = true; mealTH = "มื้อเย็น"; // อัปเดตสถานะมื้อเย็น
+      }
+
+      soundSuccess();                                      // ส่งเสียงยืนยันว่าทำงานสำเร็จ
+      dispensePill(activeMeal);                            // สั่งให้ Servo จ่ายยาตามองศาของมื้อนั้นๆ
+      sendRFIDLog("จ่ายยาสำเร็จ", scannedUID);                // บันทึกการจ่ายยาลง Log
+
+      String successMsg = "✅ [รับยาสำเร็จ] ได้ทำการแตะรับยา" + mealTH + " เรียบร้อยแล้ว\n⏰ เวลา: " + getCurrentTime(); // ข้อความส่งเข้า Telegram
+      bot.sendMessage(CHAT_ID, successMsg, "");            // บอทส่งข้อความแจ้งเตือนความสำเร็จไปที่กลุ่ม
+    }
+  }
+
+  mfrc522.PICC_HaltA();                                    // สั่งปิดการสื่อสารกับบัตรใบปัจจุบัน (ป้องกันการอ่านซ้ำรัวๆ)
+  mfrc522.PCD_StopCrypto1();                               // หยุดการเข้ารหัสชั่วคราว
+  delay(2000);                                             // หน่วงเวลา 2 วินาทีก่อนให้แตะครั้งต่อไป
+}
